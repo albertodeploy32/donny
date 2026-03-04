@@ -254,15 +254,24 @@ def _af_headers(key: str) -> dict:
 
 
 def get_fixtures(key: str, league_id: int, season: int, from_date: str, to_date: str) -> list:
+    """
+    Recupera le fixture nel range di date.
+    Non usiamo status=NS perché bloccato nel piano free —
+    filtriamo lato Python tenendo solo partite non ancora giocate.
+    """
     r = requests.get(
         "https://v3.football.api-sports.io/fixtures",
         headers=_af_headers(key),
-        params={"league": league_id, "season": season, "from": from_date,
-                "to": to_date, "status": "NS", "timezone": "Europe/Rome"},
+        params={"league": league_id, "season": season,
+                "from": from_date, "to": to_date},
         timeout=15,
     )
     r.raise_for_status()
-    return r.json().get("response", [])
+    all_fixtures = r.json().get("response", [])
+    # Filtra lato client: solo partite non ancora iniziate
+    not_started = {"NS", "TBD", "SUSP", "PST"}
+    return [f for f in all_fixtures
+            if f.get("fixture", {}).get("status", {}).get("short", "NS") in not_started]
 
 
 def get_team_stats(key: str, team_id: int, league_id: int, season: int) -> dict:
@@ -280,11 +289,15 @@ def get_last_matches(key: str, team_id: int, last: int = 10) -> list:
     r = requests.get(
         "https://v3.football.api-sports.io/fixtures",
         headers=_af_headers(key),
-        params={"team": team_id, "last": last, "status": "FT"},
+        params={"team": team_id, "last": last},
         timeout=15,
     )
     r.raise_for_status()
-    return r.json().get("response", [])
+    all_matches = r.json().get("response", [])
+    # Filtra lato client: solo partite finite
+    finished = {"FT", "AET", "PEN", "AWD", "WO"}
+    return [m for m in all_matches
+            if m.get("fixture", {}).get("status", {}).get("short", "") in finished]
 
 
 def get_odds_apifootball(key: str, fixture_id: int) -> dict:
@@ -865,7 +878,15 @@ if load_btn:
                 fxs = fetch_fixtures_cached(api_key, LEAGUES[lg]["id"], CURRENT_SEASON, from_str, to_str)
                 st.session_state["fixtures_by_league"][lg] = fxs
             except Exception as e:
-                st.error(f"Errore {lg}: {e}")
+                err_str = str(e)
+                if "403" in err_str:
+                    st.error(f"❌ {lg}: chiave API non valida o piano insufficiente (403). Controlla su api-football.com.")
+                elif "401" in err_str:
+                    st.error(f"❌ {lg}: chiave API non autorizzata (401). Verifica che sia corretta.")
+                elif "429" in err_str:
+                    st.error(f"❌ {lg}: limite giornaliero API raggiunto (429). Riprova domani.")
+                else:
+                    st.error(f"❌ {lg}: {e}")
 
 fixtures_map = st.session_state.get("fixtures_by_league", {})
 all_fixtures = [(lg, f) for lg, fxs in fixtures_map.items() for f in fxs]
