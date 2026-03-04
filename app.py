@@ -793,13 +793,24 @@ def render_detail_panel(result: dict):
         st.markdown('<div class="warn-box">⚠️ Quote non disponibili per questa partita. Il valore di value bet non può essere calcolato.</div>', unsafe_allow_html=True)
 
     # Consiglio
-    conf_col = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
-    vt = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
-    quota_html = f"""
-    <div>
-        <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">QUOTA</div>
-        <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:rgba(255,255,255,0.8);">×{best['odd']:.2f}</div>
-    </div>""" if best["odd"] > 0 else ""
+    conf_col  = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
+    ev_col    = "#4ade80" if best["ev"] > 0 else "#f87171"
+    ev_sign   = "+" if best["ev"] > 0 else ""
+    ev_val    = f"{ev_sign}{best['ev']:.3f}"
+    vt        = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
+    quota_str = f"×{best['odd']:.2f}" if best["odd"] > 0 else ""
+
+    quota_block = f"""
+        <div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">QUOTA</div>
+            <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:rgba(255,255,255,0.8);">{quota_str}</div>
+        </div>""" if quota_str else ""
+
+    ev_block = f"""
+        <div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">EV</div>
+            <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:{ev_col};">{ev_val}</div>
+        </div>""" if best["odd"] > 0 else ""
 
     st.markdown(f"""
     <div class="stat-box" style="border-color:rgba(74,222,128,0.2);">
@@ -810,11 +821,8 @@ def render_detail_panel(result: dict):
                 <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">CONFIDENZA</div>
                 <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:{conf_col};">{conf}%</div>
             </div>
-            {quota_html}
-            <div>
-                <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">EV</div>
-                <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:{'#4ade80' if best['ev']>0 else '#f87171'};">{'+'if best['ev']>0 else ''}{best['ev']:.3f}</div>
-            </div>
+            {quota_block}
+            {ev_block}
         </div>
     </div>
     """, unsafe_allow_html=True)
