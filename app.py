@@ -8,10 +8,8 @@ from collections import defaultdict
 
 # ─────────────────────────────────────────────
 #  CARICAMENTO CHIAVI API
-#  Priorità: Streamlit Secrets → .env → input manuale
 # ─────────────────────────────────────────────
 def _load_keys() -> tuple[str, str]:
-    """Ritorna (rapidapi_key, odds_api_key). Stringa vuota se non trovata."""
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -115,6 +113,31 @@ html, body, [class*="css"] { font-family:'DM Sans',sans-serif; background-color:
 
 .key-ok  { background:rgba(74,222,128,0.08); border:1px solid rgba(74,222,128,0.2); border-radius:10px; padding:10px 14px; margin-bottom:8px; }
 .key-mis { background:rgba(248,113,113,0.08); border:1px solid rgba(248,113,113,0.2); border-radius:10px; padding:10px 14px; margin-bottom:8px; }
+
+.prescreened-badge {
+    display:inline-block;
+    background:rgba(250,204,21,0.12);
+    border:1px solid rgba(250,204,21,0.3);
+    border-radius:20px;
+    padding:2px 10px;
+    font-family:'DM Mono',monospace;
+    font-size:0.58rem;
+    font-weight:700;
+    letter-spacing:0.1em;
+    color:#facc15;
+}
+.auto-badge {
+    display:inline-block;
+    background:rgba(96,165,250,0.12);
+    border:1px solid rgba(96,165,250,0.3);
+    border-radius:20px;
+    padding:2px 10px;
+    font-family:'DM Mono',monospace;
+    font-size:0.58rem;
+    font-weight:700;
+    letter-spacing:0.1em;
+    color:#60a5fa;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -131,18 +154,15 @@ LEAGUES = {
 }
 
 def current_season() -> int:
-    """
-    Calcola la stagione calcistica corrente.
-    La stagione X/X+1 inizia ad agosto → da agosto in poi = anno corrente.
-    Da gennaio a luglio = anno precedente.
-    """
     now = datetime.now()
     return now.year if now.month >= 8 else now.year - 1
 
 CURRENT_SEASON = current_season()
 MAX_SCORELINE  = 6
 
-# Bookmaker preferiti per The Odds API (ordine di priorità)
+# Soglia pre-screening: punteggio minimo per auto-analisi completa
+PRESCREENING_THRESHOLD = 0.55
+
 PREFERRED_BOOKMAKERS = ["pinnacle", "bet365", "williamhill", "unibet", "betfair"]
 
 
@@ -196,7 +216,6 @@ def value_bet(prob_pct: float, odd: float) -> bool:
 
 
 def implied_prob(odd: float) -> float:
-    """Probabilità implicita dalla quota (senza margine)."""
     return (1 / odd * 100) if odd > 0 else 0.0
 
 
@@ -247,28 +266,94 @@ def best_suggestion(markets: dict, odds: dict, form_h: float, form_a: float, lam
 
 
 # ─────────────────────────────────────────────
+#  PRE-SCREENING (zero chiamate API)
+#  Stima interesse della partita da dati fixture
+# ─────────────────────────────────────────────
+def prescreening_score(fixture: dict, league_name: str) -> float:
+    """
+    Calcola un punteggio di interesse [0..1] per una partita
+    usando SOLO i dati già disponibili nel fixture (nessuna chiamata API).
+    Le partite sopra PRESCREENING_THRESHOLD vengono auto-analizzate.
+
+    Fattori considerati:
+    - Campionato (Premier e Liga leggermente penalizzate per meno varianza)
+    - Ora del giorno (prime time = più interesse)
+    - Data (più vicina = più rilevante)
+    - Nomi squadre (top club = score alto)
+    """
+    score = 0.5  # base neutra
+
+    # Bonus campionato — tutti top5 ma pesi diversi
+    league_weights = {
+        "Serie A 🇮🇹":        0.05,
+        "Premier League 🏴󠁧󠁢󠁥󠁮󠁧󠁿": 0.08,
+        "La Liga 🇪🇸":         0.07,
+        "Bundesliga 🇩🇪":      0.04,
+        "Ligue 1 🇫🇷":         0.03,
+    }
+    score += league_weights.get(league_name, 0.0)
+
+    # Bonus ora prime time (19:00-22:00 UTC)
+    try:
+        dt = datetime.fromisoformat(fixture["fixture"]["date"].replace("Z", "+00:00"))
+        if 19 <= dt.hour <= 22:
+            score += 0.07
+        elif 14 <= dt.hour <= 18:
+            score += 0.04
+        # Penalizza partite lontane (>1 giorno)
+        days_away = (dt.replace(tzinfo=None) - datetime.utcnow()).days
+        if days_away == 0:
+            score += 0.10
+        elif days_away == 1:
+            score += 0.05
+    except Exception:
+        pass
+
+    # Bonus top club (lista europea delle squadre più seguite)
+    top_clubs = {
+        "real madrid", "barcelona", "manchester city", "manchester united",
+        "liverpool", "chelsea", "arsenal", "tottenham", "juventus", "inter",
+        "milan", "napoli", "roma", "lazio", "psg", "bayern", "borussia",
+        "atletico", "sevilla", "benfica", "porto", "ajax", "roma",
+    }
+    home = fixture["teams"]["home"]["name"].lower()
+    away = fixture["teams"]["away"]["name"].lower()
+    for club in top_clubs:
+        if club in home or club in away:
+            score += 0.10
+            break
+    # Derby check (stessa città, storico)
+    derby_pairs = [
+        ("inter", "milan"), ("roma", "lazio"), ("juventus", "torino"),
+        ("manchester", "manchester"), ("arsenal", "chelsea"), ("liverpool", "everton"),
+        ("real", "atletico"), ("barcelona", "espanyol"), ("psg", "marseille"),
+    ]
+    for a, b in derby_pairs:
+        if (a in home and b in away) or (b in home and a in away):
+            score += 0.15
+            break
+
+    return min(round(score, 3), 1.0)
+
+
+# ─────────────────────────────────────────────
 #  API-FOOTBALL — wrapper
 # ─────────────────────────────────────────────
 def _af_headers(key: str) -> dict:
     return {"X-Auth-Token": key}
 
 
-# Mappa campionato → codice football-data.org
 FD_LEAGUE_MAP = {
-    135: "SA",    # Serie A
-    39:  "PL",    # Premier League
-    140: "PD",    # La Liga (Primera Division)
-    78:  "BL1",   # Bundesliga
-    61:  "FL1",   # Ligue 1
+    135: "SA",
+    39:  "PL",
+    140: "PD",
+    78:  "BL1",
+    61:  "FL1",
 }
 FD_BASE = "https://api.football-data.org/v4"
 
 
 def get_fixtures(key: str, league_id: int, season: int, from_date: str, to_date: str) -> list:
-    """
-    Recupera le fixture future da football-data.org.
-    Ritorna una lista normalizzata compatibile col resto del codice.
-    """
     fd_code = FD_LEAGUE_MAP.get(league_id)
     if not fd_code:
         return []
@@ -280,7 +365,6 @@ def get_fixtures(key: str, league_id: int, season: int, from_date: str, to_date:
     )
     r.raise_for_status()
     matches = r.json().get("matches", [])
-    # Normalizza nel formato usato dal resto del codice
     result = []
     for m in matches:
         result.append({
@@ -299,19 +383,7 @@ def get_fixtures(key: str, league_id: int, season: int, from_date: str, to_date:
     return result
 
 
-def get_team_stats(key: str, team_id: int, league_id: int, season: int) -> dict:
-    """
-    football-data.org non ha un endpoint statistiche aggregato nel piano free.
-    Ritorna dict vuoto — le medie vengono calcolate dalle ultime partite.
-    """
-    return {}
-
-
 def get_last_matches(key: str, team_id: int, last: int = 10) -> list:
-    """
-    Recupera le ultime partite di un team da football-data.org.
-    Normalizza nel formato usato dal resto del codice.
-    """
     r = requests.get(
         f"{FD_BASE}/teams/{team_id}/matches",
         headers=_af_headers(key),
@@ -340,7 +412,6 @@ def get_last_matches(key: str, team_id: int, last: int = 10) -> list:
 
 
 def get_odds_apifootball(key: str, fixture_id: int) -> dict:
-    """Quote da API-Football (Bet365 bookmaker ID 8). Usato come fallback."""
     r = requests.get(
         "https://v3.football.api-sports.io/odds",
         headers=_af_headers(key),
@@ -373,16 +444,11 @@ def get_odds_apifootball(key: str, fixture_id: int) -> dict:
 #  THE ODDS API — wrapper
 # ─────────────────────────────────────────────
 def _average_odd(bookmakers: list, key_path: list, preferred: list) -> float:
-    """
-    Calcola la media delle quote tra i bookmaker disponibili.
-    Naviga key_path nella struttura outcomes per estrarre il valore.
-    """
     values = []
     bm_map = {bm["key"]: bm for bm in bookmakers}
-    # Prima prova i preferiti, poi tutti gli altri
     ordered = [bm_map[k] for k in preferred if k in bm_map] + \
               [bm for k, bm in bm_map.items() if k not in preferred]
-    for bm in ordered[:6]:  # max 6 bookmaker per la media
+    for bm in ordered[:6]:
         for market in bm.get("markets", []):
             if market["key"] == key_path[0]:
                 for outcome in market.get("outcomes", []):
@@ -393,22 +459,10 @@ def _average_odd(bookmakers: list, key_path: list, preferred: list) -> float:
                             pass
     if not values:
         return 0.0
-    avg = sum(values) / len(values)
-    return round(avg, 3)
+    return round(sum(values) / len(values), 3)
 
 
-def get_odds_theoddsapi(
-    key: str,
-    sport_key: str,
-    home_team: str,
-    away_team: str,
-    match_date: str,
-) -> dict:
-    """
-    Recupera e aggrega quote da The Odds API per una partita specifica.
-    Ritorna le quote medie tra i bookmaker europei principali.
-    sport_key: es. "soccer_italy_serie_a"
-    """
+def get_odds_theoddsapi(key: str, sport_key: str, home_team: str, away_team: str, match_date: str) -> dict:
     r = requests.get(
         f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
         params={
@@ -423,13 +477,11 @@ def get_odds_theoddsapi(
     r.raise_for_status()
     events = r.json()
 
-    # Trova l'evento corrispondente (home + away + data entro 24h)
     target_date = datetime.fromisoformat(match_date.replace("Z", "+00:00"))
     best_event  = None
     for ev in events:
         ev_home = ev.get("home_team", "").lower()
         ev_away = ev.get("away_team", "").lower()
-        # Match fuzzy sul nome squadra (primi 5 caratteri)
         if (home_team[:5].lower() in ev_home or ev_home[:5] in home_team.lower()) and \
            (away_team[:5].lower() in ev_away or ev_away[:5] in away_team.lower()):
             try:
@@ -443,31 +495,23 @@ def get_odds_theoddsapi(
     if not best_event:
         return {}
 
-    bookmakers = best_event.get("bookmakers", [])
-    result     = {}
-
-    # 1X2
-    h = _average_odd(bookmakers, ["h2h", home_team], PREFERRED_BOOKMAKERS)
-    # The Odds API usa i nomi reali delle squadre come outcome
-    # Proviamo col nome originale dell'evento
+    bookmakers   = best_event.get("bookmakers", [])
     ev_home_name = best_event.get("home_team", home_team)
     ev_away_name = best_event.get("away_team", away_team)
+    result       = {}
 
     home_odd = _average_odd(bookmakers, ["h2h", ev_home_name], PREFERRED_BOOKMAKERS)
     draw_odd = _average_odd(bookmakers, ["h2h", "Draw"],        PREFERRED_BOOKMAKERS)
     away_odd = _average_odd(bookmakers, ["h2h", ev_away_name], PREFERRED_BOOKMAKERS)
+    if home_odd: result["home"] = home_odd
+    if draw_odd: result["draw"] = draw_odd
+    if away_odd: result["away"] = away_odd
 
-    if home_odd: result["home"]  = home_odd
-    if draw_odd: result["draw"]  = draw_odd
-    if away_odd: result["away"]  = away_odd
-
-    # Over/Under 2.5
     over_odd  = _average_odd(bookmakers, ["totals", "Over"],  PREFERRED_BOOKMAKERS)
     under_odd = _average_odd(bookmakers, ["totals", "Under"], PREFERRED_BOOKMAKERS)
     if over_odd:  result["over25"]  = over_odd
     if under_odd: result["under25"] = under_odd
 
-    # GG / NoGG
     gg_odd   = _average_odd(bookmakers, ["btts", "Yes"], PREFERRED_BOOKMAKERS)
     nogg_odd = _average_odd(bookmakers, ["btts", "No"],  PREFERRED_BOOKMAKERS)
     if gg_odd:   result["gg"]   = gg_odd
@@ -478,19 +522,8 @@ def get_odds_theoddsapi(
 
 # ─────────────────────────────────────────────
 #  ORCHESTRATORE QUOTE
-#  The Odds API (primario) → API-Football (fallback)
 # ─────────────────────────────────────────────
-def get_best_odds(
-    af_key: str,
-    odds_key: str,
-    fixture: dict,
-    league_name: str,
-) -> tuple[dict, str]:
-    """
-    Ritorna (odds_dict, source_label).
-    Tenta The Odds API se la chiave è disponibile,
-    altrimenti cade su API-Football/Bet365.
-    """
+def get_best_odds(af_key: str, odds_key: str, fixture: dict, league_name: str) -> tuple[dict, str]:
     home_name  = fixture["teams"]["home"]["name"]
     away_name  = fixture["teams"]["away"]["name"]
     match_date = fixture["fixture"]["date"]
@@ -503,9 +536,8 @@ def get_best_odds(
             if odds:
                 return odds, "The Odds API (media bookmaker EU)"
         except Exception:
-            pass  # fallback silenzioso
+            pass
 
-    # Fallback: API-Football / Bet365
     try:
         odds = get_odds_apifootball(af_key, fix_id)
         if odds:
@@ -531,28 +563,7 @@ def extract_form(matches: list, team_id: int) -> list:
     return form
 
 
-def compute_lambda(stats_team: dict, stats_opp: dict, is_home: bool, league_avg: float = 1.35) -> float:
-    venue     = "home" if is_home else "away"
-    opp_venue = "away" if is_home else "home"
-    try:
-        scored   = float(stats_team.get("goals", {}).get("for",     {}).get("average", {}).get(venue,     None) or league_avg)
-        conceded = float(stats_opp .get("goals", {}).get("against", {}).get("average", {}).get(opp_venue, None) or league_avg)
-    except (TypeError, ValueError):
-        scored = conceded = league_avg
-
-    att = scored   / league_avg if league_avg > 0 else 1.0
-    dfs = conceded / league_avg if league_avg > 0 else 1.0
-    return max(round(att * dfs * league_avg, 3), 0.1)
-
-
-# ─────────────────────────────────────────────
-#  ANALISI COMPLETA (cacheata per sessione)
-# ─────────────────────────────────────────────
 def goals_avg_from_matches(matches: list, team_id: int, is_home: bool) -> tuple[float, float]:
-    """
-    Calcola media gol segnati e subiti dalle ultime partite.
-    Separa casa/trasferta secondo is_home.
-    """
     scored, conceded = [], []
     for m in matches:
         home_id = m["teams"]["home"]["id"]
@@ -568,14 +579,16 @@ def goals_avg_from_matches(matches: list, team_id: int, is_home: bool) -> tuple[
     return avg(scored), avg(conceded)
 
 
+# ─────────────────────────────────────────────
+#  ANALISI COMPLETA (cacheata per sessione)
+# ─────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int, league_name: str, season: int) -> dict:
-    fix_id  = fixture["fixture"]["id"]
-    team_h  = fixture["teams"]["home"]["id"]
-    team_a  = fixture["teams"]["away"]["id"]
+    team_h = fixture["teams"]["home"]["id"]
+    team_a = fixture["teams"]["away"]["id"]
 
-    last_h    = get_last_matches(af_key, team_h, last=10)
-    last_a    = get_last_matches(af_key, team_a, last=10)
+    last_h = get_last_matches(af_key, team_h, last=10)
+    last_a = get_last_matches(af_key, team_a, last=10)
 
     odds, odds_source = get_best_odds(af_key, odds_key, fixture, league_name)
 
@@ -584,13 +597,11 @@ def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int,
     form_h     = compute_form_weight(form_raw_h)
     form_a     = compute_form_weight(form_raw_a)
 
-    # Medie gol calcolate dalle ultime partite (casa per home, trasferta per away)
     h_scored, h_conceded = goals_avg_from_matches(last_h, team_h, is_home=True)
     a_scored, a_conceded = goals_avg_from_matches(last_a, team_a, is_home=False)
 
     league_avg = (h_scored + a_scored) / 2
 
-    # Lambda Poisson: att_home × def_away × league_avg
     att_h = h_scored   / league_avg if league_avg > 0 else 1.0
     def_a = a_conceded / league_avg if league_avg > 0 else 1.0
     att_a = a_scored   / league_avg if league_avg > 0 else 1.0
@@ -598,9 +609,6 @@ def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int,
 
     lam_h = round(max(att_h * def_a * league_avg * form_h, 0.1), 3)
     lam_a = round(max(att_a * def_h * league_avg * form_a, 0.1), 3)
-
-    stats_h = {}
-    stats_a = {}
 
     matrix  = build_score_matrix(lam_h, lam_a)
     markets = compute_markets(matrix)
@@ -612,19 +620,19 @@ def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int,
         kickoff = fixture["fixture"]["date"][:16]
 
     return {
-        "match":        fixture,
-        "league_name":  league_name,
-        "kickoff":      kickoff,
-        "lam_home":     lam_h,
-        "lam_away":     lam_a,
-        "markets":      markets,
-        "odds":         odds,
-        "odds_source":  odds_source,
-        "best":         best,
-        "candidates":   candidates,
-        "analysis":     analysis,
-        "form_home":    form_h,
-        "form_away":    form_a,
+        "match":         fixture,
+        "league_name":   league_name,
+        "kickoff":       kickoff,
+        "lam_home":      lam_h,
+        "lam_away":      lam_a,
+        "markets":       markets,
+        "odds":          odds,
+        "odds_source":   odds_source,
+        "best":          best,
+        "candidates":    candidates,
+        "analysis":      analysis,
+        "form_home":     form_h,
+        "form_away":     form_a,
         "form_raw_home": form_raw_h,
         "form_raw_away": form_raw_a,
     }
@@ -700,31 +708,43 @@ def render_detail_panel(result: dict):
     # Forma
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown(f'<div class="stat-box"><div class="stat-label">{home.upper()} — FORMA</div>{form_dots_html(form_raw_h)}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">{home.upper()} — FORMA</div>{form_dots_html(form_raw_h)}</div>',
+            unsafe_allow_html=True
+        )
     with c2:
-        st.markdown(f'<div class="stat-box"><div class="stat-label">{away.upper()} — FORMA</div>{form_dots_html(form_raw_a)}</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="stat-box"><div class="stat-label">{away.upper()} — FORMA</div>{form_dots_html(form_raw_a)}</div>',
+            unsafe_allow_html=True
+        )
 
     # Gol attesi
     st.markdown(f"""
     <div class="stat-box">
         <div class="stat-label">GOL ATTESI (POISSON)</div>
         <div style="display:flex;justify-content:space-around;align-items:center;padding-top:6px;">
-            <div style="text-align:center;"><div class="xg-label">{home.upper()}</div><div class="xg-num-home">{lam_h:.2f}</div></div>
+            <div style="text-align:center;">
+                <div class="xg-label">{home.upper()}</div>
+                <div class="xg-num-home">{lam_h:.2f}</div>
+            </div>
             <div style="color:rgba(255,255,255,0.15);font-size:1.4rem;font-family:'DM Mono',monospace;">—</div>
-            <div style="text-align:center;"><div class="xg-label">{away.upper()}</div><div class="xg-num-away">{lam_a:.2f}</div></div>
+            <div style="text-align:center;">
+                <div class="xg-label">{away.upper()}</div>
+                <div class="xg-num-away">{lam_a:.2f}</div>
+            </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     # Mercati
     market_rows = [
-        ("Vittoria Casa (1)",  markets["p1"],    "#60a5fa"),
-        ("Pareggio (X)",       markets["px"],    "#a78bfa"),
-        ("Vittoria Ospiti (2)",markets["p2"],    "#f472b6"),
-        ("Over 2.5",           markets["over"],  "#34d399"),
-        ("Under 2.5",          markets["under"], "#94a3b8"),
-        ("GG",                 markets["gg"],    "#4ade80"),
-        ("NoGG",               markets["nogg"],  "#fb923c"),
+        ("Vittoria Casa (1)",   markets["p1"],    "#60a5fa"),
+        ("Pareggio (X)",        markets["px"],    "#a78bfa"),
+        ("Vittoria Ospiti (2)", markets["p2"],    "#f472b6"),
+        ("Over 2.5",            markets["over"],  "#34d399"),
+        ("Under 2.5",           markets["under"], "#94a3b8"),
+        ("GG",                  markets["gg"],    "#4ade80"),
+        ("NoGG",                markets["nogg"],  "#fb923c"),
     ]
     rows_html = ""
     for label, prob, color in market_rows:
@@ -736,17 +756,20 @@ def render_detail_panel(result: dict):
             </div>
             {progress_bar_html(prob, color)}
         </div>"""
-    st.markdown(f'<div class="stat-box"><div class="stat-label">PROBABILITÀ MERCATI</div>{rows_html}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="stat-box"><div class="stat-label">PROBABILITÀ MERCATI</div>{rows_html}</div>',
+        unsafe_allow_html=True
+    )
 
     # Quote
     if odds:
         boxes = (
-            odd_box_html("1",    odds.get("home",    0), best["label"] == "1")    +
-            odd_box_html("X",    odds.get("draw",    0), best["label"] == "X")    +
-            odd_box_html("2",    odds.get("away",    0), best["label"] == "2")    +
-            odd_box_html("O2.5", odds.get("over25",  0), markets["over"]  > 60)   +
-            odd_box_html("U2.5", odds.get("under25", 0))                          +
-            odd_box_html("GG",   odds.get("gg",      0), markets["gg"]    > 60)   +
+            odd_box_html("1",    odds.get("home",    0), best["label"] == "1")  +
+            odd_box_html("X",    odds.get("draw",    0), best["label"] == "X")  +
+            odd_box_html("2",    odds.get("away",    0), best["label"] == "2")  +
+            odd_box_html("O2.5", odds.get("over25",  0), markets["over"]  > 60) +
+            odd_box_html("U2.5", odds.get("under25", 0))                        +
+            odd_box_html("GG",   odds.get("gg",      0), markets["gg"]    > 60) +
             odd_box_html("NoGG", odds.get("nogg",    0))
         )
         st.markdown(f"""
@@ -756,7 +779,7 @@ def render_detail_panel(result: dict):
         </div>
         """, unsafe_allow_html=True)
 
-        # Tabella edge per ogni mercato
+        # Tabella edge
         edge_rows = ""
         for c in cands:
             if c["odd"] <= 0:
@@ -769,7 +792,7 @@ def render_detail_panel(result: dict):
                 <td style="padding:5px 8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:rgba(255,255,255,0.5);text-align:center;">{c['prob']}%</td>
                 <td style="padding:5px 8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:rgba(255,255,255,0.5);text-align:center;">{c['implied']}%</td>
                 <td style="padding:5px 8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:{edge_color};text-align:center;font-weight:700;">{'+' if c['edge']>0 else ''}{c['edge']}pp</td>
-                <td style="padding:5px 8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:rgba(255,255,255,0.5);text-align:right;">×{c['odd']:.2f}</td>
+                <td style="padding:5px 8px;font-family:'DM Mono',monospace;font-size:0.75rem;color:rgba(255,255,255,0.5);text-align:right;">x{c['odd']:.2f}</td>
             </tr>"""
 
         st.markdown(f"""
@@ -790,15 +813,18 @@ def render_detail_panel(result: dict):
         </div>
         """, unsafe_allow_html=True)
     else:
-        st.markdown('<div class="warn-box">⚠️ Quote non disponibili per questa partita. Il valore di value bet non può essere calcolato.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="warn-box">⚠️ Quote non disponibili per questa partita. Il valore di value bet non può essere calcolato.</div>',
+            unsafe_allow_html=True
+        )
 
-    # Consiglio
+    # Consiglio principale
     conf_col  = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
     ev_col    = "#4ade80" if best["ev"] > 0 else "#f87171"
     ev_sign   = "+" if best["ev"] > 0 else ""
     ev_val    = f"{ev_sign}{best['ev']:.3f}"
     vt        = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
-    quota_str = f"×{best['odd']:.2f}" if best["odd"] > 0 else ""
+    quota_str = f"x{best['odd']:.2f}" if best["odd"] > 0 else ""
 
     quota_block = f"""
         <div>
@@ -827,13 +853,12 @@ def render_detail_panel(result: dict):
     </div>
     """, unsafe_allow_html=True)
 
-    # Analisi testuale
-    st.markdown(f"""
-    <div class="stat-box">
-        <div class="stat-label">ANALISI</div>
-        <p style="font-size:0.82rem;color:rgba(255,255,255,0.58);line-height:1.75;margin:0;">{analysis}</p>
-    </div>
-    """, unsafe_allow_html=True)
+    # Analisi testuale — renderizzata come markdown nativo per evitare HTML grezzo
+    st.markdown(
+        f'<div class="stat-box"><div class="stat-label">ANALISI</div></div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(analysis)
 
 
 # ─────────────────────────────────────────────
@@ -847,7 +872,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── API-FOOTBALL KEY ──
     st.markdown('<div class="stat-label" style="margin-bottom:6px;">FOOTBALL-DATA.ORG KEY</div>', unsafe_allow_html=True)
     st.markdown(key_status_html(bool(_env_af), "CHIAVE CARICATA", "da .env / Secrets"), unsafe_allow_html=True)
     if _env_af:
@@ -858,7 +882,6 @@ with st.sidebar:
 
     st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
 
-    # ── THE ODDS API KEY ──
     st.markdown('<div class="stat-label" style="margin-bottom:6px;">THE ODDS API KEY</div>', unsafe_allow_html=True)
     st.markdown(key_status_html(bool(_env_odds), "CHIAVE CARICATA", "da .env / Secrets"), unsafe_allow_html=True)
     if _env_odds:
@@ -868,14 +891,25 @@ with st.sidebar:
         odds_key = st.text_input("The Odds API key", type="password", placeholder="Opzionale — migliora le quote", label_visibility="collapsed")
 
     if not odds_key:
-        st.markdown('<div class="warn-box" style="margin-top:4px;">⚠️ Senza questa chiave le quote vengono prese da API-Football (Bet365 solo). Con The Odds API si usa la media tra più bookmaker EU per un edge più preciso.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="warn-box" style="margin-top:4px;">⚠️ Senza questa chiave le quote vengono prese da API-Football (Bet365 solo). Con The Odds API si usa la media tra più bookmaker EU per un edge più preciso.</div>',
+            unsafe_allow_html=True
+        )
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
-
     st.markdown('<div class="stat-label" style="margin-bottom:8px;">CAMPIONATI</div>', unsafe_allow_html=True)
     selected_leagues = st.multiselect("Campionati", options=list(LEAGUES.keys()), default=list(LEAGUES.keys()), label_visibility="collapsed")
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
+
+    # Soglia pre-screening regolabile
+    st.markdown('<div class="stat-label" style="margin-bottom:8px;">SOGLIA AUTO-ANALISI</div>', unsafe_allow_html=True)
+    threshold = st.slider(
+        "Soglia pre-screening",
+        min_value=0.40, max_value=0.90, value=PRESCREENING_THRESHOLD,
+        step=0.05, label_visibility="collapsed",
+        help="Partite con score di interesse superiore a questa soglia vengono analizzate automaticamente"
+    )
 
     odds_mode = "The Odds API (media EU)" if odds_key else "API-Football / Bet365"
     st.markdown(f"""
@@ -884,7 +918,8 @@ with st.sidebar:
     STATISTICHE: FOOTBALL-DATA.ORG<br>
     QUOTE: {odds_mode.upper()}<br>
     STAGIONE: {CURRENT_SEASON}/{CURRENT_SEASON+1}<br>
-    FINESTRA: +5 GIORNI<br><br>
+    FINESTRA: +2 GIORNI<br>
+    PRESCREENING: ATTIVO (SOGLIA {threshold:.2f})<br><br>
     Le previsioni sono stime<br>
     statistiche, non garanzie.
     </div>
@@ -905,7 +940,7 @@ if not api_key:
     st.markdown("""
     <div class="info-box">
         🔑 Inserisci la tua <strong>Football-Data.org key</strong> nella sidebar per iniziare.<br>
-        Chiave gratuita su <strong>football-data.org</strong> → registrati e trovala nella tua dashboard (piano Free: 10 req/min).<br><br>
+        Chiave gratuita su <strong>football-data.org</strong> → registrati e trovale nella tua dashboard (piano Free: 10 req/min).<br><br>
         Opzionale: <strong>The Odds API key</strong> su <strong>the-odds-api.com</strong>
         (500 req/mese free) per quote aggregate da più bookmaker europei.
     </div>
@@ -918,10 +953,10 @@ if not selected_leagues:
 
 
 # ─────────────────────────────────────────────
-#  STEP 1: CARICA PARTITE
+#  STEP 1: CARICA PARTITE (finestra 2 giorni)
 # ─────────────────────────────────────────────
 today    = datetime.now()
-end_date = today + timedelta(days=5)
+end_date = today + timedelta(days=2)          # ← ridotto da 5 a 2 giorni
 from_str = today.strftime("%Y-%m-%d")
 to_str   = end_date.strftime("%Y-%m-%d")
 
@@ -944,6 +979,7 @@ if "fixtures_by_league" not in st.session_state:
 if load_btn:
     st.session_state["fixtures_by_league"] = {}
     st.session_state.pop("analysis_results", None)
+    st.session_state.pop("prescreening_done", None)
     with st.spinner("Recupero partite in corso..."):
         for lg in selected_leagues:
             try:
@@ -952,9 +988,9 @@ if load_btn:
             except Exception as e:
                 err_str = str(e)
                 if "403" in err_str:
-                    st.error(f"❌ {lg}: chiave API non valida o piano insufficiente (403). Controlla su api-football.com.")
+                    st.error(f"❌ {lg}: chiave API non valida o piano insufficiente (403).")
                 elif "401" in err_str:
-                    st.error(f"❌ {lg}: chiave API non autorizzata (401). Verifica che sia corretta.")
+                    st.error(f"❌ {lg}: chiave API non autorizzata (401).")
                 elif "429" in err_str:
                     st.error(f"❌ {lg}: limite giornaliero API raggiunto (429). Riprova domani.")
                 else:
@@ -970,31 +1006,73 @@ if not all_fixtures:
 
 
 # ─────────────────────────────────────────────
-#  STEP 2: SELEZIONE E ANALISI
+#  STEP 1b: PRE-SCREENING AUTOMATICO
+#  Zero chiamate API — filtra le partite interessanti
+# ─────────────────────────────────────────────
+if "analysis_results" not in st.session_state:
+    st.session_state["analysis_results"] = {}
+
+if "prescreening_done" not in st.session_state:
+    st.session_state["prescreening_done"] = False
+
+# Calcola prescreening score per tutte le partite
+prescreened = []
+for lg, f in all_fixtures:
+    score = prescreening_score(f, lg)
+    prescreened.append((lg, f, score))
+
+# Partite sopra soglia non ancora analizzate
+to_auto_analyze = [
+    (lg, f) for lg, f, score in prescreened
+    if score >= threshold and f["fixture"]["id"] not in st.session_state["analysis_results"]
+]
+
+# Auto-analisi partite prescreened (una sola volta per sessione)
+if to_auto_analyze and not st.session_state["prescreening_done"]:
+    n = len(to_auto_analyze)
+    with st.spinner(f"🔍 Pre-screening: auto-analisi di {n} partite selezionate..."):
+        prog = st.progress(0)
+        for i, (lg, f) in enumerate(to_auto_analyze):
+            fix_id = f["fixture"]["id"]
+            home   = f["teams"]["home"]["name"]
+            away   = f["teams"]["away"]["name"]
+            try:
+                res = fetch_and_analyze(api_key, odds_key, f, LEAGUES[lg]["id"], lg, CURRENT_SEASON)
+                st.session_state["analysis_results"][fix_id] = res
+            except Exception:
+                pass  # se fallisce, l'utente può analizzare manualmente
+            prog.progress((i + 1) / n)
+        prog.empty()
+    st.session_state["prescreening_done"] = True
+    st.rerun()
+
+
+# ─────────────────────────────────────────────
+#  STEP 2: SELEZIONE E VISUALIZZAZIONE
 # ─────────────────────────────────────────────
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<div class="stat-label" style="margin-bottom:12px;">PARTITE DISPONIBILI</div>', unsafe_allow_html=True)
 
 by_day = defaultdict(list)
-for lg, f in all_fixtures:
+for lg, f, score in prescreened:
     try:
         day = datetime.fromisoformat(f["fixture"]["date"].replace("Z", "+00:00")).strftime("%A %d %B")
     except Exception:
         day = f["fixture"]["date"][:10]
-    by_day[day].append((lg, f))
+    by_day[day].append((lg, f, score))
 
 selected_day = st.selectbox("Giorno", list(by_day.keys()), label_visibility="collapsed")
 day_fixtures = by_day.get(selected_day, [])
 
+n_auto = sum(1 for _, f, s in day_fixtures if s >= threshold)
 st.markdown(f"""
 <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.28);
-            letter-spacing:0.12em;margin-bottom:14px;">{len(day_fixtures)} PARTITE · {selected_day.upper()}</div>
+            letter-spacing:0.12em;margin-bottom:14px;">
+{len(day_fixtures)} PARTITE · {selected_day.upper()} · {n_auto} AUTO-ANALIZZATE
+</div>
 """, unsafe_allow_html=True)
 
-if "analysis_results" not in st.session_state:
-    st.session_state["analysis_results"] = {}
-
-for lg, f in day_fixtures:
+for lg, f, pre_score in day_fixtures:
     fix_id = f["fixture"]["id"]
     home   = f["teams"]["home"]["name"]
     away   = f["teams"]["away"]["name"]
@@ -1005,7 +1083,16 @@ for lg, f in day_fixtures:
 
     lcolor      = LEAGUES[lg]["color"]
     is_analyzed = fix_id in st.session_state["analysis_results"]
+    is_auto     = pre_score >= threshold
     card_cls    = "match-card-selected" if is_analyzed else "match-card"
+
+    # Badge preselezione
+    if is_analyzed and is_auto:
+        badge_html = '<span class="auto-badge">AUTO-ANALIZZATA</span>'
+    elif is_auto:
+        badge_html = '<span class="prescreened-badge">PRESCREENED</span>'
+    else:
+        badge_html = f'<span style="font-family:\'DM Mono\',monospace;font-size:0.58rem;color:rgba(255,255,255,0.18);">score {pre_score:.2f}</span>'
 
     result_html = ""
     if is_analyzed:
@@ -1025,9 +1112,10 @@ for lg, f in day_fixtures:
 
     st.markdown(f"""
     <div class="{card_cls}">
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
             <div style="width:8px;height:8px;border-radius:50%;background:{lcolor};box-shadow:0 0 7px {lcolor}88;flex-shrink:0;"></div>
             <span class="league-badge">{lg} · {kickoff}</span>
+            <span style="margin-left:auto;">{badge_html}</span>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;">
             <div class="team-name">{home}</div>
@@ -1040,7 +1128,8 @@ for lg, f in day_fixtures:
 
     col_btn, _ = st.columns([1, 4])
     with col_btn:
-        if st.button("🔄 RIANALIZZA" if is_analyzed else "🔍 ANALIZZA", key=f"analyze_{fix_id}"):
+        btn_label = "🔄 RIANALIZZA" if is_analyzed else "🔍 ANALIZZA"
+        if st.button(btn_label, key=f"analyze_{fix_id}"):
             with st.spinner(f"Analisi {home} vs {away}..."):
                 try:
                     res = fetch_and_analyze(api_key, odds_key, f, LEAGUES[lg]["id"], lg, CURRENT_SEASON)
