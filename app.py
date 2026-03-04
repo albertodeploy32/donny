@@ -11,7 +11,7 @@ from collections import defaultdict
 #  Priorità: Streamlit Secrets → .env → input manuale
 # ─────────────────────────────────────────────
 def _load_keys() -> tuple[str, str]:
-    """Ritorna (api_football_key, odds_api_key). Stringa vuota se non trovata."""
+    """Ritorna (rapidapi_key, odds_api_key). Stringa vuota se non trovata."""
     try:
         from dotenv import load_dotenv
         load_dotenv()
@@ -24,8 +24,8 @@ def _load_keys() -> tuple[str, str]:
         except Exception:
             return ""
 
-    af  = from_secrets("API_FOOTBALL_KEY")  or os.environ.get("API_FOOTBALL_KEY",  "")
-    odd = from_secrets("ODDS_API_KEY")       or os.environ.get("ODDS_API_KEY",       "")
+    af  = from_secrets("FOOTBALL_DATA_KEY") or os.environ.get("FOOTBALL_DATA_KEY", "")
+    odd = from_secrets("ODDS_API_KEY")  or os.environ.get("ODDS_API_KEY",  "")
     return af.strip(), odd.strip()
 
 
@@ -250,54 +250,93 @@ def best_suggestion(markets: dict, odds: dict, form_h: float, form_a: float, lam
 #  API-FOOTBALL — wrapper
 # ─────────────────────────────────────────────
 def _af_headers(key: str) -> dict:
-    return {"x-apisports-key": key}
+    return {"X-Auth-Token": key}
+
+
+# Mappa campionato → codice football-data.org
+FD_LEAGUE_MAP = {
+    135: "SA",    # Serie A
+    39:  "PL",    # Premier League
+    140: "PD",    # La Liga (Primera Division)
+    78:  "BL1",   # Bundesliga
+    61:  "FL1",   # Ligue 1
+}
+FD_BASE = "https://api.football-data.org/v4"
 
 
 def get_fixtures(key: str, league_id: int, season: int, from_date: str, to_date: str) -> list:
     """
-    Recupera le fixture nel range di date.
-    Non usiamo status=NS perché bloccato nel piano free —
-    filtriamo lato Python tenendo solo partite non ancora giocate.
+    Recupera le fixture future da football-data.org.
+    Ritorna una lista normalizzata compatibile col resto del codice.
     """
+    fd_code = FD_LEAGUE_MAP.get(league_id)
+    if not fd_code:
+        return []
     r = requests.get(
-        "https://v3.football.api-sports.io/fixtures",
+        f"{FD_BASE}/competitions/{fd_code}/matches",
         headers=_af_headers(key),
-        params={"league": league_id, "season": season,
-                "from": from_date, "to": to_date},
+        params={"dateFrom": from_date, "dateTo": to_date, "status": "SCHEDULED,TIMED"},
         timeout=15,
     )
     r.raise_for_status()
-    all_fixtures = r.json().get("response", [])
-    # Filtra lato client: solo partite non ancora iniziate
-    not_started = {"NS", "TBD", "SUSP", "PST"}
-    return [f for f in all_fixtures
-            if f.get("fixture", {}).get("status", {}).get("short", "NS") in not_started]
+    matches = r.json().get("matches", [])
+    # Normalizza nel formato usato dal resto del codice
+    result = []
+    for m in matches:
+        result.append({
+            "fixture": {
+                "id":   m["id"],
+                "date": m["utcDate"],
+                "status": {"short": "NS"},
+            },
+            "teams": {
+                "home": {"id": m["homeTeam"]["id"], "name": m["homeTeam"]["name"]},
+                "away": {"id": m["awayTeam"]["id"], "name": m["awayTeam"]["name"]},
+            },
+            "goals": {"home": None, "away": None},
+            "_fd_league_code": fd_code,
+        })
+    return result
 
 
 def get_team_stats(key: str, team_id: int, league_id: int, season: int) -> dict:
-    r = requests.get(
-        "https://v3.football.api-sports.io/teams/statistics",
-        headers=_af_headers(key),
-        params={"team": team_id, "league": league_id, "season": season},
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.json().get("response", {})
+    """
+    football-data.org non ha un endpoint statistiche aggregato nel piano free.
+    Ritorna dict vuoto — le medie vengono calcolate dalle ultime partite.
+    """
+    return {}
 
 
 def get_last_matches(key: str, team_id: int, last: int = 10) -> list:
+    """
+    Recupera le ultime partite di un team da football-data.org.
+    Normalizza nel formato usato dal resto del codice.
+    """
     r = requests.get(
-        "https://v3.football.api-sports.io/fixtures",
+        f"{FD_BASE}/teams/{team_id}/matches",
         headers=_af_headers(key),
-        params={"team": team_id, "last": last},
+        params={"status": "FINISHED", "limit": last},
         timeout=15,
     )
     r.raise_for_status()
-    all_matches = r.json().get("response", [])
-    # Filtra lato client: solo partite finite
-    finished = {"FT", "AET", "PEN", "AWD", "WO"}
-    return [m for m in all_matches
-            if m.get("fixture", {}).get("status", {}).get("short", "") in finished]
+    matches = r.json().get("matches", [])
+    result = []
+    for m in matches:
+        hg = m.get("score", {}).get("fullTime", {}).get("home")
+        ag = m.get("score", {}).get("fullTime", {}).get("away")
+        result.append({
+            "fixture": {
+                "id":   m["id"],
+                "date": m["utcDate"],
+                "status": {"short": "FT"},
+            },
+            "teams": {
+                "home": {"id": m["homeTeam"]["id"], "name": m["homeTeam"]["name"]},
+                "away": {"id": m["awayTeam"]["id"], "name": m["awayTeam"]["name"]},
+            },
+            "goals": {"home": hg, "away": ag},
+        })
+    return result
 
 
 def get_odds_apifootball(key: str, fixture_id: int) -> dict:
@@ -509,14 +548,32 @@ def compute_lambda(stats_team: dict, stats_opp: dict, is_home: bool, league_avg:
 # ─────────────────────────────────────────────
 #  ANALISI COMPLETA (cacheata per sessione)
 # ─────────────────────────────────────────────
+def goals_avg_from_matches(matches: list, team_id: int, is_home: bool) -> tuple[float, float]:
+    """
+    Calcola media gol segnati e subiti dalle ultime partite.
+    Separa casa/trasferta secondo is_home.
+    """
+    scored, conceded = [], []
+    for m in matches:
+        home_id = m["teams"]["home"]["id"]
+        hg = m["goals"]["home"]
+        ag = m["goals"]["away"]
+        if hg is None or ag is None:
+            continue
+        if is_home and team_id == home_id:
+            scored.append(hg); conceded.append(ag)
+        elif not is_home and team_id != home_id:
+            scored.append(ag); conceded.append(hg)
+    def avg(lst): return sum(lst) / len(lst) if lst else 1.35
+    return avg(scored), avg(conceded)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int, league_name: str, season: int) -> dict:
     fix_id  = fixture["fixture"]["id"]
     team_h  = fixture["teams"]["home"]["id"]
     team_a  = fixture["teams"]["away"]["id"]
 
-    stats_h   = get_team_stats(af_key, team_h, league_id, season)
-    stats_a   = get_team_stats(af_key, team_a, league_id, season)
     last_h    = get_last_matches(af_key, team_h, last=10)
     last_a    = get_last_matches(af_key, team_a, last=10)
 
@@ -527,16 +584,23 @@ def fetch_and_analyze(af_key: str, odds_key: str, fixture: dict, league_id: int,
     form_h     = compute_form_weight(form_raw_h)
     form_a     = compute_form_weight(form_raw_a)
 
-    def league_avg_from_stats(s, venue):
-        try:
-            return float(s["goals"]["for"]["average"][venue] or 1.35)
-        except Exception:
-            return 1.35
+    # Medie gol calcolate dalle ultime partite (casa per home, trasferta per away)
+    h_scored, h_conceded = goals_avg_from_matches(last_h, team_h, is_home=True)
+    a_scored, a_conceded = goals_avg_from_matches(last_a, team_a, is_home=False)
 
-    league_avg = (league_avg_from_stats(stats_h, "home") + league_avg_from_stats(stats_a, "away")) / 2
+    league_avg = (h_scored + a_scored) / 2
 
-    lam_h = round(compute_lambda(stats_h, stats_a, is_home=True,  league_avg=league_avg) * form_h, 3)
-    lam_a = round(compute_lambda(stats_a, stats_h, is_home=False, league_avg=league_avg) * form_a, 3)
+    # Lambda Poisson: att_home × def_away × league_avg
+    att_h = h_scored   / league_avg if league_avg > 0 else 1.0
+    def_a = a_conceded / league_avg if league_avg > 0 else 1.0
+    att_a = a_scored   / league_avg if league_avg > 0 else 1.0
+    def_h = h_conceded / league_avg if league_avg > 0 else 1.0
+
+    lam_h = round(max(att_h * def_a * league_avg * form_h, 0.1), 3)
+    lam_a = round(max(att_a * def_h * league_avg * form_a, 0.1), 3)
+
+    stats_h = {}
+    stats_a = {}
 
     matrix  = build_score_matrix(lam_h, lam_a)
     markets = compute_markets(matrix)
@@ -776,13 +840,13 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     # ── API-FOOTBALL KEY ──
-    st.markdown('<div class="stat-label" style="margin-bottom:6px;">API-FOOTBALL KEY</div>', unsafe_allow_html=True)
+    st.markdown('<div class="stat-label" style="margin-bottom:6px;">FOOTBALL-DATA.ORG KEY</div>', unsafe_allow_html=True)
     st.markdown(key_status_html(bool(_env_af), "CHIAVE CARICATA", "da .env / Secrets"), unsafe_allow_html=True)
     if _env_af:
-        _ov_af = st.text_input("Sovrascrivi API-Football key", type="password", placeholder="Lascia vuoto per usare quella caricata", label_visibility="collapsed")
+        _ov_af = st.text_input("Sovrascrivi Football-Data key", type="password", placeholder="Lascia vuoto per usare quella caricata", label_visibility="collapsed")
         api_key = _ov_af.strip() if _ov_af.strip() else _env_af
     else:
-        api_key = st.text_input("API-Football key", type="password", placeholder="Incolla la tua chiave...", label_visibility="collapsed")
+        api_key = st.text_input("Football-Data.org key", type="password", placeholder="Incolla la tua chiave football-data.org...", label_visibility="collapsed")
 
     st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
 
@@ -809,7 +873,7 @@ with st.sidebar:
     st.markdown(f"""
     <div style="font-family:'DM Mono',monospace;font-size:0.58rem;color:rgba(255,255,255,0.18);line-height:1.9;letter-spacing:0.08em;">
     MODELLO: POISSON + FORMA<br>
-    STATISTICHE: API-FOOTBALL<br>
+    STATISTICHE: FOOTBALL-DATA.ORG<br>
     QUOTE: {odds_mode.upper()}<br>
     STAGIONE: {CURRENT_SEASON}/{CURRENT_SEASON+1}<br>
     FINESTRA: +5 GIORNI<br><br>
@@ -832,8 +896,8 @@ st.markdown("""
 if not api_key:
     st.markdown("""
     <div class="info-box">
-        🔑 Inserisci la tua <strong>API-Football key</strong> nella sidebar per iniziare.<br>
-        Chiave gratuita su <strong>api-football.com</strong> (100 richieste/giorno).<br><br>
+        🔑 Inserisci la tua <strong>Football-Data.org key</strong> nella sidebar per iniziare.<br>
+        Chiave gratuita su <strong>football-data.org</strong> → registrati e trovala nella tua dashboard (piano Free: 10 req/min).<br><br>
         Opzionale: <strong>The Odds API key</strong> su <strong>the-odds-api.com</strong>
         (500 req/mese free) per quote aggregate da più bookmaker europei.
     </div>
@@ -992,6 +1056,6 @@ st.markdown("""
 <div style="text-align:center;font-family:'DM Mono',monospace;font-size:0.58rem;
             color:rgba(255,255,255,0.12);letter-spacing:0.12em;padding-bottom:24px;">
 DONNY — FOOTBALL INTELLIGENCE · POISSON + FORMA RECENTE<br>
-DATI: API-FOOTBALL.COM · QUOTE: THE ODDS API / BET365 · USO RESPONSABILE
+DATI: FOOTBALL-DATA.ORG · QUOTE: THE ODDS API / BET365 · USO RESPONSABILE
 </div>
 """, unsafe_allow_html=True)
