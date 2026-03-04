@@ -818,44 +818,55 @@ def render_detail_panel(result: dict):
             unsafe_allow_html=True
         )
 
-    # Consiglio principale
-    conf_col  = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
-    ev_col    = "#4ade80" if best["ev"] > 0 else "#f87171"
-    ev_sign   = "+" if best["ev"] > 0 else ""
-    ev_val    = f"{ev_sign}{best['ev']:.3f}"
-    vt        = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
-    quota_str = f"x{best['odd']:.2f}" if best["odd"] > 0 else ""
+    # Consiglio principale — usiamo colonne Streamlit per evitare HTML condizionale annidato
+    conf_col = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
+    ev_col   = "#4ade80" if best["ev"] > 0 else "#f87171"
+    ev_sign  = "+" if best["ev"] > 0 else ""
+    ev_val   = f"{ev_sign}{best['ev']:.3f}"
 
-    quota_block = f"""
-        <div>
-            <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">QUOTA</div>
-            <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:rgba(255,255,255,0.8);">{quota_str}</div>
-        </div>""" if quota_str else ""
-
-    ev_block = f"""
-        <div>
-            <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">EV</div>
-            <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:{ev_col};">{ev_val}</div>
-        </div>""" if best["odd"] > 0 else ""
-
-    st.markdown(f"""
-    <div class="stat-box" style="border-color:rgba(74,222,128,0.2);">
-        <div class="stat-label">CONSIGLIO PRINCIPALE {vt}</div>
-        <div style="display:flex;align-items:center;gap:20px;margin-top:8px;">
-            <div class="{cc}">{best['label']}</div>
-            <div>
-                <div style="font-family:'DM Mono',monospace;font-size:0.65rem;color:rgba(255,255,255,0.3);">CONFIDENZA</div>
-                <div style="font-family:'DM Mono',monospace;font-size:1.1rem;font-weight:700;color:{conf_col};">{conf}%</div>
-            </div>
-            {quota_block}
-            {ev_block}
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Analisi testuale — renderizzata come markdown nativo per evitare HTML grezzo
     st.markdown(
-        f'<div class="stat-box"><div class="stat-label">ANALISI</div></div>',
+        '<div class="stat-box" style="border-color:rgba(74,222,128,0.2);padding-bottom:8px;">'
+        '<div class="stat-label">CONSIGLIO PRINCIPALE</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    col_label, col_conf, col_quota, col_ev = st.columns([1, 2, 2, 2])
+    with col_label:
+        st.markdown(f'<div class="{cc}" style="margin-top:4px;">{best["label"]}</div>', unsafe_allow_html=True)
+    with col_conf:
+        st.markdown(
+            f'<div style="font-family:\'DM Mono\',monospace;">'
+            f'<div style="font-size:0.6rem;color:rgba(255,255,255,0.3);margin-bottom:2px;">CONFIDENZA</div>'
+            f'<div style="font-size:1.1rem;font-weight:700;color:{conf_col};">{conf}%</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    with col_quota:
+        if best["odd"] > 0:
+            st.markdown(
+                f'<div style="font-family:\'DM Mono\',monospace;">'
+                f'<div style="font-size:0.6rem;color:rgba(255,255,255,0.3);margin-bottom:2px;">QUOTA</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:rgba(255,255,255,0.8);">x{best["odd"]:.2f}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    with col_ev:
+        if best["odd"] > 0:
+            st.markdown(
+                f'<div style="font-family:\'DM Mono\',monospace;">'
+                f'<div style="font-size:0.6rem;color:rgba(255,255,255,0.3);margin-bottom:2px;">EV</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{ev_col};">{ev_val}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+    if best["value"]:
+        st.markdown('<span class="value-tag">✦ VALUE BET</span>', unsafe_allow_html=True)
+
+    # Analisi testuale — st.markdown nativo interpreta correttamente il bold **...**
+    st.markdown(
+        '<div class="stat-box" style="margin-top:8px;"><div class="stat-label">ANALISI</div></div>',
         unsafe_allow_html=True
     )
     st.markdown(analysis)
@@ -1094,22 +1105,7 @@ for lg, f, pre_score in day_fixtures:
     else:
         badge_html = f'<span style="font-family:\'DM Mono\',monospace;font-size:0.58rem;color:rgba(255,255,255,0.18);">score {pre_score:.2f}</span>'
 
-    result_html = ""
-    if is_analyzed:
-        res  = st.session_state["analysis_results"][fix_id]
-        best = res["best"]
-        conf = best["prob"]
-        cc   = conf_class(conf)
-        vt   = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
-        src  = res.get("odds_source", "")
-        src_html = f'<span style="font-family:\'DM Mono\',monospace;font-size:0.6rem;color:rgba(255,255,255,0.22);">quote: {src}</span>' if src else ""
-        result_html = f"""
-        <div style="display:flex;align-items:center;gap:14px;margin-top:12px;flex-wrap:wrap;">
-            <div class="{cc}">{best['label']}</div>
-            <div style="font-family:'DM Mono',monospace;font-size:0.7rem;color:rgba(255,255,255,0.35);">{conf}% confidenza</div>
-            {vt} {src_html}
-        </div>"""
-
+    # Card header — solo parte statica, nessun HTML dinamico annidato
     st.markdown(f"""
     <div class="{card_cls}">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;">
@@ -1122,9 +1118,28 @@ for lg, f, pre_score in day_fixtures:
             <div style="font-family:'DM Mono',monospace;font-size:0.75rem;color:rgba(255,255,255,0.18);padding:0 14px;">VS</div>
             <div class="team-name" style="text-align:right;">{away}</div>
         </div>
-        {result_html}
     </div>
     """, unsafe_allow_html=True)
+
+    # Risultato analisi — reso separatamente per evitare HTML grezzo annidato
+    if is_analyzed:
+        res  = st.session_state["analysis_results"][fix_id]
+        best = res["best"]
+        conf = best["prob"]
+        cc   = conf_class(conf)
+        src  = res.get("odds_source", "")
+
+        conf_color = "#4ade80" if conf >= 65 else ("#facc15" if conf >= 48 else "#f87171")
+        vb_tag     = '<span class="value-tag">VALUE BET</span>' if best["value"] else ""
+        src_span   = f'<span style="font-family:\'DM Mono\',monospace;font-size:0.6rem;color:rgba(255,255,255,0.22);">quote: {src}</span>' if src else ""
+
+        st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:14px;margin:-8px 0 8px 0;padding:0 4px;flex-wrap:wrap;">
+            <div class="{cc}">{best['label']}</div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.7rem;color:{conf_color};">{conf}% confidenza</div>
+            {vb_tag} {src_span}
+        </div>
+        """, unsafe_allow_html=True)
 
     col_btn, _ = st.columns([1, 4])
     with col_btn:
