@@ -130,7 +130,16 @@ LEAGUES = {
     "Ligue 1 🇫🇷":         {"id": 61,  "color": "#004494", "odds_key": "soccer_france_ligue_one"},
 }
 
-CURRENT_SEASON = 2024
+def current_season() -> int:
+    """
+    Calcola la stagione calcistica corrente.
+    La stagione X/X+1 inizia ad agosto → da agosto in poi = anno corrente.
+    Da gennaio a luglio = anno precedente.
+    """
+    now = datetime.now()
+    return now.year if now.month >= 8 else now.year - 1
+
+CURRENT_SEASON = current_season()
 MAX_SCORELINE  = 6
 
 # Bookmaker preferiti per The Odds API (ordine di priorità)
@@ -783,17 +792,13 @@ with st.sidebar:
 
     st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-    st.markdown('<div class="stat-label" style="margin-bottom:8px;">STAGIONE</div>', unsafe_allow_html=True)
-    season = st.selectbox("Stagione", [2024, 2023], label_visibility="collapsed")
-
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-
     odds_mode = "The Odds API (media EU)" if odds_key else "API-Football / Bet365"
     st.markdown(f"""
     <div style="font-family:'DM Mono',monospace;font-size:0.58rem;color:rgba(255,255,255,0.18);line-height:1.9;letter-spacing:0.08em;">
     MODELLO: POISSON + FORMA<br>
     STATISTICHE: API-FOOTBALL<br>
     QUOTE: {odds_mode.upper()}<br>
+    STAGIONE: {CURRENT_SEASON}/{CURRENT_SEASON+1}<br>
     FINESTRA: +5 GIORNI<br><br>
     Le previsioni sono stime<br>
     statistiche, non garanzie.
@@ -857,7 +862,7 @@ if load_btn:
     with st.spinner("Recupero partite in corso..."):
         for lg in selected_leagues:
             try:
-                fxs = fetch_fixtures_cached(api_key, LEAGUES[lg]["id"], season, from_str, to_str)
+                fxs = fetch_fixtures_cached(api_key, LEAGUES[lg]["id"], CURRENT_SEASON, from_str, to_str)
                 st.session_state["fixtures_by_league"][lg] = fxs
             except Exception as e:
                 st.error(f"Errore {lg}: {e}")
@@ -945,7 +950,7 @@ for lg, f in day_fixtures:
         if st.button("🔄 RIANALIZZA" if is_analyzed else "🔍 ANALIZZA", key=f"analyze_{fix_id}"):
             with st.spinner(f"Analisi {home} vs {away}..."):
                 try:
-                    res = fetch_and_analyze(api_key, odds_key, f, LEAGUES[lg]["id"], lg, season)
+                    res = fetch_and_analyze(api_key, odds_key, f, LEAGUES[lg]["id"], lg, CURRENT_SEASON)
                     st.session_state["analysis_results"][fix_id] = res
                     st.rerun()
                 except Exception as e:
