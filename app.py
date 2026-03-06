@@ -9,119 +9,145 @@ from datetime import datetime, timedelta
 from itertools import product
 
 # ─────────────────────────────────────────────
-#  CARICAMENTO CHIAVI API
+#  CONFIGURAZIONE E CHIAVI
 # ─────────────────────────────────────────────
-def _load_keys() -> tuple[str, str]:
-    try: from dotenv import load_dotenv; load_dotenv()
-    except ImportError: pass
-    def from_secrets(name):
-        try: return st.secrets.get(name, "") or ""
-        except Exception: return ""
-    af = from_secrets("FOOTBALL_DATA_KEY") or os.environ.get("FOOTBALL_DATA_KEY", "")
-    return af.strip(), ""
+st.set_page_config(page_title="Donny | Intelligence", page_icon="⚽", layout="wide")
 
-_env_af, _ = _load_keys()
+def _load_keys():
+    af = st.secrets.get("FOOTBALL_DATA_KEY", os.environ.get("FOOTBALL_DATA_KEY", ""))
+    odd = st.secrets.get("ODDS_API_KEY", os.environ.get("ODDS_API_KEY", ""))
+    return af.strip(), odd.strip()
+
+_env_af, _env_odds = _load_keys()
 
 # ─────────────────────────────────────────────
-#  PAGE CONFIG & CSS (Allineato al Template)
+#  STILE CSS (REFINED DARK MODE)
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="Donny | Intelligence System", page_icon="⚽", layout="wide")
-
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 *, html, body, [class*="css"] { font-family: 'Figtree', sans-serif !important; }
 .stApp { background: #050505 !important; color: #eee; }
-
-/* Table Styling per Estrazione Dati */
-.match-table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 0.8rem; }
-.match-table th { background: rgba(255,255,255,0.05); color: #888; padding: 12px; text-align: center; border: 1px solid rgba(255,255,255,0.1); font-family: 'JetBrains Mono'; }
-.match-table td { padding: 10px; border: 1px solid rgba(255,255,255,0.05); text-align: center; }
-.match-table tr:hover { background: rgba(10, 132, 255, 0.05); }
-
-/* Disclaimer conforme al template */
-.disclaimer { font-size: 0.65rem; color: rgba(255,255,255,0.3); text-align: center; margin-top: 40px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px; line-height: 1.5; }
-.badge-pick { background: #0a84ff; color: white; padding: 2px 6px; border-radius: 4px; font-weight: 700; font-family: 'JetBrains Mono'; }
+.match-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 20px; margin-bottom: 15px; }
+.badge { font-family: 'JetBrains Mono'; font-size: 0.7rem; padding: 4px 8px; border-radius: 4px; background: rgba(10, 132, 255, 0.2); color: #0a84ff; font-weight: 700; }
+.metric-box { text-align: center; padding: 10px; background: rgba(255,255,255,0.02); border-radius: 8px; }
+.disclaimer { font-size: 0.6rem; color: #555; text-align: center; margin-top: 50px; text-transform: uppercase; letter-spacing: 1px; }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-#  LOGICA DI CALCOLO (Poisson + Mercati Template)
+#  ENGINE DI CALCOLO
 # ─────────────────────────────────────────────
-def poisson_prob(lam, k): return (math.exp(-lam) * (lam**k) / math.factorial(k)) if lam > 0 else (1.0 if k==0 else 0.0)
+def poisson_prob(lam, k):
+    return (math.exp(-lam) * (lam**k) / math.factorial(k)) if lam > 0 else (1.0 if k==0 else 0.0)
 
 @st.cache_data(ttl=3600)
-def get_stats(key, tid):
-    url = f"https://api.football-data.org/v4/teams/{tid}/matches"
-    r = requests.get(url, headers={"X-Auth-Token": key}, params={"status": "FINISHED", "limit": 10})
-    if r.status_code == 429: time.sleep(10); return get_stats(key, tid)
-    matches = r.json().get("matches", [])
-    h_s, h_c, a_s, a_c = [], [], [], []
-    for m in matches:
-        is_h = m["homeTeam"]["id"] == tid
-        gs, gc = (m["score"]["fullTime"]["home"], m["score"]["fullTime"]["away"]) if is_h else (m["score"]["fullTime"]["away"], m["score"]["fullTime"]["home"])
-        if gs is not None:
-            if is_h: h_s.append(gs); h_c.append(gc)
-            else: a_s.append(gs); a_c.append(gc)
-    return {"hs": sum(h_s)/len(h_s) if h_s else 1.3, "hc": sum(h_c)/len(h_c) if h_c else 1.1, "as": sum(a_s)/len(a_s) if a_s else 1.0, "ac": sum(a_c)/len(a_c) if a_c else 1.4}
+def get_stats(key, team_id):
+    headers = {"X-Auth-Token": key}
+    url = f"https://api.football-data.org/v4/teams/{team_id}/matches"
+    try:
+        r = requests.get(url, headers=headers, params={"status": "FINISHED", "limit": 12}, timeout=10)
+        if r.status_code == 429: 
+            time.sleep(5)
+            return get_stats(key, team_id)
+        data = r.json().get("matches", [])
+        h_s, h_c, a_s, a_c = [], [], [], []
+        for m in data:
+            is_home = m["homeTeam"]["id"] == team_id
+            score = m["score"]["fullTime"]
+            if score["home"] is None: continue
+            if is_home: h_s.append(score["home"]); h_c.append(score["away"])
+            else: a_s.append(score["away"]); a_c.append(score["home"])
+        return {
+            "h_att": sum(h_s)/len(h_s) if h_s else 1.3, "h_def": sum(h_c)/len(h_c) if h_c else 1.0,
+            "a_att": sum(a_s)/len(a_s) if a_s else 1.0, "a_def": sum(a_c)/len(a_c) if a_c else 1.3
+        }
+    except: return {"h_att": 1.3, "h_def": 1.1, "a_att": 1.0, "a_def": 1.4}
 
-def analyze(key, m):
-    h, a = get_stats(key, m["homeTeam"]["id"]), get_stats(key, m["awayTeam"]["id"])
-    lh, la = max(h["hs"] * a["ac"] / 1.3, 0.2), max(a["as"] * h["hc"] / 1.3, 0.2)
-    matrix = {(gh, ga): poisson_prob(lh, gh) * poisson_prob(la, ga) for gh, ga in product(range(6), range(6))}
+def analyze_match(af_key, m):
+    h_stats = get_stats(af_key, m["homeTeam"]["id"])
+    a_stats = get_stats(af_key, m["awayTeam"]["id"])
+    
+    # Lambda calculation (Home/Away cross-impact)
+    lam_h = max((h_stats["h_att"] * a_stats["a_def"]) / 1.25, 0.2)
+    lam_a = max((a_stats["a_att"] * h_stats["h_def"]) / 1.25, 0.2)
+    
+    matrix = {(gh, ga): poisson_prob(lam_h, gh) * poisson_prob(lam_a, ga) for gh, ga in product(range(6), range(6))}
     
     p1 = sum(v for (gh, ga), v in matrix.items() if gh > ga)
     px = sum(v for (gh, ga), v in matrix.items() if gh == ga)
     p2 = sum(v for (gh, ga), v in matrix.items() if gh < ga)
     pov = sum(v for (gh, ga), v in matrix.items() if gh + ga > 2.5)
     
-    # Nuovi Mercati dal Template
-    p1x = p1 + px
-    px2 = px + p2
-    p12 = p1 + p2
-    und = 1 - pov
+    probs = {
+        "1": p1*100, "X": px*100, "2": p2*100, "1X": (p1+px)*100, 
+        "X2": (px+p2)*100, "12": (p1+p2)*100, "U2.5": (1-pov)*100, "O2.5": pov*100
+    }
     
-    best = "1" if p1 > p2 and p1 > px else ("2" if p2 > p1 and p2 > px else "X")
-    if pov > 0.65: best = "O2.5"
+    best_label = "1" if p1 > p2 and p1 > px else ("2" if p2 > p1 and p2 > px else "X")
+    if pov > 0.65: best_label = "O2.5"
     
-    return {"1": p1*100, "X": px*100, "2": p2*100, "1X": p1x*100, "12": p12*100, "X2": px2*100, "U2.5": und*100, "O2.5": pov*100, "best": best}
+    return {"probs": probs, "best": best_label, "lam_h": lam_h, "lam_a": lam_a, "matrix": matrix}
 
 # ─────────────────────────────────────────────
-#  INTERFACCIA
+#  INTERFACCIA UTENTE
 # ─────────────────────────────────────────────
-st.title("⚽ Donny Prediction System")
+st.markdown('<div style="font-size: 2rem; font-weight: 800; letter-spacing: -1px;">DONNY</div>', unsafe_allow_html=True)
+st.markdown('<div style="font-family: JetBrains Mono; color: #555; font-size: 0.7rem; margin-bottom: 30px;">FOOTBALL INTELLIGENCE SYSTEM</div>', unsafe_allow_html=True)
 
 if not _env_af:
-    st.error("API Key mancante.")
+    st.warning("⚠️ Configura FOOTBALL_DATA_KEY nei Secrets di Streamlit.")
     st.stop()
 
-if st.button("🔄 Genera Estrazione Dati"):
-    with st.spinner("Elaborazione dati in corso..."):
-        # Esempio su Serie A (ID: SA)
-        res = requests.get("https://api.football-data.org/v4/competitions/SA/matches", headers={"X-Auth-Token": _env_af}, params={"status": "SCHEDULED"}).json()
-        matches = res.get("matches", [])[:8] # Primi 8 match
-        
-        html_table = """<table class="match-table"><thead><tr>
-            <th>PARTITA</th><th>1</th><th>X</th><th>2</th><th>1X</th><th>12</th><th>X2</th><th>U2.5</th><th>O2.5</th><th>PICK</th>
-        </tr></thead><tbody>"""
-        
-        for m in matches:
-            data = analyze(_env_af, m)
-            html_table += f"""<tr>
-                <td><b>{m['homeTeam']['shortName']} - {m['awayTeam']['shortName']}</b></td>
-                <td>{data['1']:.0f}%</td><td>{data['X']:.0f}%</td><td>{data['2']:.0f}%</td>
-                <td>{data['1X']:.0f}%</td><td>{data['12']:.0f}%</td><td>{data['X2']:.0f}%</td>
-                <td>{data['U2.5']:.0f}%</td><td>{data['O2.5']:.0f}%</td>
-                <td><span class="badge-pick">{data['best']}</span></td>
-            </tr>"""
-        
-        html_table += "</tbody></table>"
-        st.markdown(html_table, unsafe_allow_html=True)
+# Sidebar per selezione campionati
+leagues = {"Serie A": "SA", "Premier League": "PL", "La Liga": "PD", "Bundesliga": "BL1", "Ligue 1": "FL1"}
+sel_league = st.sidebar.selectbox("Seleziona Campionato", list(leagues.keys()))
 
-# Footer conforme al Template
-st.markdown(f"""
+if st.button("🚀 AVVIA ANALISI PALINSESTO"):
+    with st.spinner(f"Analizzando {sel_league}..."):
+        headers = {"X-Auth-Token": _env_af}
+        url = f"https://api.football-data.org/v4/competitions/{leagues[sel_league]}/matches"
+        res = requests.get(url, headers=headers, params={"status": "SCHEDULED"})
+        
+        if res.status_code != 200:
+            st.error("Errore nel recupero dati. Controlla la tua API Key.")
+        else:
+            matches = res.json().get("matches", [])[:10] # Analizza i primi 10 match
+            
+            for m in matches:
+                time.sleep(0.6) # Prevenzione rate limit
+                data = analyze_match(_env_af, m)
+                p = data["probs"]
+                
+                with st.container():
+                    st.markdown(f"""
+                    <div class="match-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span class="badge">{sel_league.upper()}</span>
+                                <div style="font-size: 1.1rem; font-weight: 700; margin-top: 5px;">
+                                    {m['homeTeam']['name']} <span style="color: #555;">v</span> {m['awayTeam']['name']}
+                                </div>
+                                <div style="font-size: 0.7rem; color: #888; margin-top: 2px;">{m['utcDate'][:10]} • {m['utcDate'][11:16]} UTC</div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-family: 'JetBrains Mono'; font-size: 1.2rem; font-weight: 700; color: #0a84ff;">{data['best']}</div>
+                                <div style="font-size: 0.6rem; color: #555;">SUGGESTED PICK</div>
+                            </div>
+                        </div>
+                        <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.05); margin: 15px 0;">
+                        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
+                            <div class="metric-box"><div style="font-size: 0.6rem; color: #888;">1X2</div><div style="font-weight:600;">{p['1']:.0f}% · {p['X']:.0f}% · {p['2']:.0f}%</div></div>
+                            <div class="metric-box"><div style="font-size: 0.6rem; color: #888;">DOPPIA CHANCE</div><div style="font-weight:600;">{p['1X']:.0f}% · {p['X2']:.0f}%</div></div>
+                            <div class="metric-box"><div style="font-size: 0.6rem; color: #888;">GOL TOTALI</div><div style="font-weight:600;">U {p['U2.5']:.0f}% · O {p['O2.5']:.0f}%</div></div>
+                            <div class="metric-box"><div style="font-size: 0.6rem; color: #888;">EXP. GOL</div><div style="font-weight:600;">{data['lam_h']:.2f} - {data['lam_a']:.2f}</div></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+st.markdown("""
 <div class="disclaimer">
     IL GIOCO È VIETATO AI MINORI DI 18 ANNI E PUÒ CAUSARE DIPENDENZA PATOLOGICA.<br>
-    PROBABILITÀ DI VINCITA SUL SITO ADM. | DONNY SYSTEM V2.2
+    DONNY INTELLIGENCE SYSTEM • DATA PROVIDED BY FOOTBALL-DATA.ORG
 </div>
 """, unsafe_allow_html=True)
