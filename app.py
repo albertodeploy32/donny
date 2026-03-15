@@ -9,7 +9,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────
 #  CONFIGURAZIONE
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="Donny v4.0 AI-PRO", page_icon="⚽", layout="wide")
+st.set_page_config(page_title="Donny v4.1 AI-PRO", page_icon="⚽", layout="wide")
 
 def get_keys():
     return st.secrets.get("FOOTBALL_DATA_KEY", os.environ.get("FOOTBALL_DATA_KEY", "")).strip()
@@ -47,13 +47,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
-#  LOGICA PREDITTIVA v4.0
-#  Modifiche rispetto a v3.6:
-#    1. rho Dixon-Coles corretto a -0.13 (era +0.15, invertiva la correzione)
-#    2. Normalizzazione lambda con split casa/trasferta 54/46
-#    3. Form trend: moltiplicatore basato su ultimi 3 vs ultimi 4-10 match
-#    4. Regression to mean 70/30: ancora le stime alla media campionato
-#    5. Smart Pick conservativo con confidence score
+#  LOGICA PREDITTIVA v4.1
+#  Fix rispetto a v4.0:
+#    1. Normalizzazione difensiva corretta:
+#       - def_h normalizzato su mu_a (gol che subisce la casa = gol segnati in trasferta)
+#       - def_a normalizzato su mu_h (gol che subisce la trasferta = gol segnati in casa)
+#    2. O2.5/U2.5 normalizzati su total_p per coerenza con gli altri mercati
+#    3. Soglia candidato UNDER 1.5 alzata a 60% (era 48%, semanticamente errata)
 # ─────────────────────────────────────────────
 
 def poisson(lam, k):
@@ -68,8 +68,6 @@ def dixon_coles_tau(gh, ga, lh, la, rho=-0.13):
     rho NEGATIVO (valore originale del paper: -0.13):
       - aumenta la probabilità di 0-0 e 1-1  (Poisson le sottostima)
       - riduce  la probabilità di 1-0 e 0-1  (Poisson le sovrastima)
-
-    Il codice precedente usava rho=+0.15 che invertiva entrambe le correzioni.
     """
     if gh == 0 and ga == 0:
         return 1.0 - lh * la * rho          # > 1  con rho neg → aumenta 0-0
@@ -131,8 +129,6 @@ def get_advanced_stats(team_id, venue_type="HOME"):
         def_avg  = sum(g * w for g, w in gc_list) / total_w
 
         # ── Form Trend ──────────────────────────────────────────
-        # Rapporto media gol segnati ultimi 3 match vs match 4-10.
-        # Se la squadra è in crescita (trend > 1) aumenta lievemente la lambda.
         if len(gs_list) >= 6:
             r3_w   = sum(w for _, w in gs_list[:3])
             r3_att = sum(g * w for g, w in gs_list[:3]) / r3_w
@@ -141,7 +137,7 @@ def get_advanced_stats(team_id, venue_type="HOME"):
             old_att = sum(g * w for g, w in gs_list[3:]) / old_w if old_w > 0 else att_avg
 
             form_trend = r3_att / max(old_att, 0.30)
-            # Clamp: max ±25% di variazione — evita amplificazioni eccessive
+            # Clamp: max ±25% di variazione
             form_trend = max(0.78, min(form_trend, 1.25))
         else:
             form_trend = 1.0
@@ -168,20 +164,13 @@ def smart_pick(res):
     - Genera tutti i pick candidati con il loro livello di fiducia stimato.
     - Seleziona il pick con confidence massima.
     - Restituisce "NO BET" se nessun pick supera la soglia minima del 62%.
-
-    Differenze rispetto a v3.6:
-    - Doppia chance (1X/X2): threshold abbassato a 80% ma corretto con P(UN4.5) ≈ 91%
-    - Segno singolo: 1 a ≥67%, 2 a ≥63%
-    - Mercati gol: solo se ≥65% (era 64% e 68%)
-    - GG/NG: threshold 68% e 65%
-    - NO BET se confidence < 62%
     """
     candidates = []
 
     p1x = res["1"] + res["X"]
     px2 = res["2"] + res["X"]
 
-    # Doppia chance + Under 4.5 (UN4.5 si verifica in ~91% delle partite europee)
+    # Doppia chance + Under 4.5 (~91% delle partite europee finisce sotto 4.5)
     if p1x >= 80:
         candidates.append(("1X + UNDER 4.5", round(p1x * 0.91, 1)))
     if px2 >= 80:
@@ -206,8 +195,8 @@ def smart_pick(res):
     if ng >= 65:
         candidates.append(("NO GOAL", round(ng, 1)))
 
-    # Under 1.5 (partite molto chiuse)
-    if res["U1.5"] >= 48:
+    # Under 1.5 — soglia candidato alzata a 60% (gate finale rimane 62%)
+    if res["U1.5"] >= 60:
         candidates.append(("UNDER 1.5", round(res["U1.5"], 1)))
 
     if not candidates:
@@ -224,51 +213,47 @@ def smart_pick(res):
 
 def run_pro_analysis(m, league_avg):
     """
-    Analisi bivariante Dixon-Coles v4.0.
+    Analisi bivariante Dixon-Coles v4.1.
 
-    Schema di calcolo:
-      1. Scarica ultime 10 partite per ciascuna squadra (2 chiamate API).
-      2. Normalizza att/def rispetto alle medie campionato splittate 54/46 casa-trasferta.
-      3. Applica regression to mean 70/30 per evitare lambda estreme.
-      4. Moltiplica per form_trend (+/- fino al 25%) per catturare il momento.
-      5. Calcola la matrice di probabilità 8x8 con correzione τ Dixon-Coles.
-      6. Chiama smart_pick() per il suggerimento finale.
+    Fix normalizzazione difensiva:
+      - def_h (debolezza difensiva della casa) → normalizzato su mu_a
+        perché la casa subisce gol segnati dalla trasferta (media mu_a)
+      - def_a (debolezza difensiva della trasferta) → normalizzato su mu_h
+        perché la trasferta subisce gol segnati dalla casa (media mu_h)
+
+    Senza questo fix, il modello gonfiava λH del ~15% e deflazionava
+    λA del ~13%, amplificando artificialmente il vantaggio casalingo.
     """
     h_s = get_advanced_stats(m["homeTeam"]["id"], "HOME")
     if h_s == "LIMIT":
         return "LIMIT_ERROR"
-    time.sleep(0.6)  # anti-throttle invariato
+    time.sleep(0.6)  # anti-throttle
 
     a_s = get_advanced_stats(m["awayTeam"]["id"], "AWAY")
     if a_s == "LIMIT":
         return "LIMIT_ERROR"
 
     # ── Media gol per squadra, split casa/trasferta ──────────────
-    # In media nei top 5 campionati europei:
-    #   54% dei gol totali è segnato dalla squadra di casa
-    #   46% è segnato dalla squadra in trasferta
     mu_h = league_avg * 0.535   # gol attesi per la squadra di casa
     mu_a = league_avg * 0.465   # gol attesi per la squadra in trasferta
 
     # ── Parametri di forza normalizzati ─────────────────────────
-    # attack_strength > 1 → squadra sopra la media in attacco
-    # defense_weakness > 1 → squadra sopra la media nel subire gol
+    # FIX v4.1: def_h normalizzato su mu_a, def_a su mu_h
+    # Logica: la difesa casa subisce gol prodotti dalla trasferta (→ baseline mu_a)
+    #         la difesa trasferta subisce gol prodotti dalla casa (→ baseline mu_h)
     att_h = max(h_s["att"] / mu_h, 0.25)
-    def_h = max(h_s["def"] / mu_h, 0.25)
+    def_h = max(h_s["def"] / mu_a, 0.25)   # ← FIX: era / mu_h
     att_a = max(a_s["att"] / mu_a, 0.25)
-    def_a = max(a_s["def"] / mu_a, 0.25)
+    def_a = max(a_s["def"] / mu_h, 0.25)   # ← FIX: era / mu_a
 
     # ── Regression to mean (70% squad stats / 30% league mean) ──
-    # Un parametro di 1.0 equivale alla media campionato.
-    # Blend: riduce l'impatto di outlier statistici (es. squadra con 2 match utili).
     α = 0.70
     att_h = att_h * α + 1.0 * (1 - α)
     def_h = def_h * α + 1.0 * (1 - α)
     att_a = att_a * α + 1.0 * (1 - α)
     def_a = def_a * α + 1.0 * (1 - α)
 
-    # ── Lambda expected goals (schema Dixon-Coles standard) ─────
-    # λH = attacco casa × debolezza difensiva avversaria × media campionato
+    # ── Lambda expected goals ────────────────────────────────────
     lh = att_h * def_a * mu_h * h_s["form_trend"]
     la = att_a * def_h * mu_a * a_s["form_trend"]
 
@@ -283,7 +268,7 @@ def run_pro_analysis(m, league_avg):
     for gh, ga in product(range(8), range(8)):
         p_raw = poisson(lh, gh) * poisson(la, ga)
         tau   = dixon_coles_tau(gh, ga, lh, la, rho=-0.13)
-        p_adj = max(p_raw * tau, 0.0)   # garantisce non-negatività
+        p_adj = max(p_raw * tau, 0.0)
 
         if   gh > ga: p1 += p_adj
         elif gh == ga: px += p_adj
@@ -293,26 +278,26 @@ def run_pro_analysis(m, league_avg):
         if gh + ga < 1.5:          p_under15 += p_adj
         if gh > 0 and ga > 0:      pgg      += p_adj
 
-    # Normalizzazione finale (per sicurezza dopo aggiustamenti)
+    # Normalizzazione finale
     total_p = p1 + px + p2
     if total_p < 0.001:
         total_p = 1.0
 
+    # FIX v4.1: O2.5/U2.5/GG/U1.5 normalizzati su total_p per coerenza
     res = {
         "1":    (p1    / total_p) * 100,
         "X":    (px    / total_p) * 100,
         "2":    (p2    / total_p) * 100,
-        "O2.5": pov25  * 100,
-        "U2.5": (1 - pov25) * 100,
-        "GG":   pgg    * 100,
-        "U1.5": p_under15 * 100,
+        "O2.5": (pov25    / total_p) * 100,
+        "U2.5": ((total_p - pov25) / total_p) * 100,
+        "GG":   (pgg      / total_p) * 100,
+        "U1.5": (p_under15 / total_p) * 100,
         "xG_H": round(lh, 2),
         "xG_A": round(la, 2),
     }
 
     pick, confidence = smart_pick(res)
 
-    # Confidence visibile nel badge (es. "OVER 2.5 · 68%")
     if pick != "NO BET" and confidence > 0:
         res["PICK"] = f"{pick} · {confidence}%"
     else:
@@ -322,10 +307,10 @@ def run_pro_analysis(m, league_avg):
 
 
 # ─────────────────────────────────────────────
-#  INTERFACCIA STREAMLIT  (invariata)
+#  INTERFACCIA STREAMLIT
 # ─────────────────────────────────────────────
-st.title("⚽ Donny Smart Loader v4.0 AI-PRO")
-st.caption("Dixon-Coles τ corretto | Form Trend | Regression to Mean | xG normalizzati")
+st.title("⚽ Donny Smart Loader v4.1 AI-PRO")
+st.caption("Dixon-Coles τ | Form Trend | Regression to Mean | Normalizzazione difensiva corretta v4.1")
 
 if not AF_KEY:
     st.error("Inserisci la chiave API nei Secrets.")
@@ -393,4 +378,4 @@ if "matches" in st.session_state:
                 </div>
                 """, unsafe_allow_html=True)
 
-st.markdown('<div class="disclaimer">MODELLO PRO STATISTICO AVANZATO. I DATI NON GARANTISCONO VINCITE. | V4.0 AI-PRO</div>', unsafe_allow_html=True)
+st.markdown('<div class="disclaimer">MODELLO PRO STATISTICO AVANZATO. I DATI NON GARANTISCONO VINCITE. | V4.1 AI-PRO</div>', unsafe_allow_html=True)
