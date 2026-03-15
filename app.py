@@ -326,20 +326,45 @@ l_meta = {
 
 league_name = st.selectbox("Seleziona Campionato", list(l_meta.keys()))
 
-if "matches" not in st.session_state or st.sidebar.button("🔄 Carica Nuovi Match"):
+# ─────────────────────────────────────────────
+# BUG FIX #1 — League change detection
+# Se il campionato selezionato è diverso da quello in session_state,
+# invalidiamo i match cached per forzare un nuovo caricamento.
+# Senza questo fix, i match del campionato precedente restano in cache
+# anche dopo che l'utente cambia campionato nella selectbox.
+# ─────────────────────────────────────────────
+if st.session_state.get("current_league") != league_name:
+    st.session_state.pop("matches", None)
+    st.session_state["current_league"] = league_name
+
+reload_requested = st.sidebar.button("🔄 Carica Nuovi Match")
+
+if "matches" not in st.session_state or reload_requested:
     headers = {"X-Auth-Token": AF_KEY}
     try:
-        r = requests.get(
+        api_response = requests.get(
             f"https://api.football-data.org/v4/competitions/{l_meta[league_name]['id']}/matches",
             headers=headers,
             params={"status": "SCHEDULED"},
         )
-        if r.status_code == 200:
-            st.session_state.matches = r.json().get("matches", [])[:12]
+        if api_response.status_code == 200:
+            st.session_state.matches = api_response.json().get("matches", [])[:12]
         else:
-            st.error(f"Errore API {r.status_code}. Controlla il piano.")
+            st.error(f"Errore API {api_response.status_code}. Controlla il piano.")
+            # ─────────────────────────────────────────────────────
+            # BUG FIX #2 — Prevent infinite API retry loop
+            # Se l'API risponde con un codice non-200 (es. 401 chiave
+            # errata, 403, 404), senza settare session_state.matches
+            # la condizione "matches not in session_state" rimane True
+            # ad ogni re-render → loop infinito di chiamate API fallite.
+            # Settiamo una lista vuota per uscire dal loop.
+            # ─────────────────────────────────────────────────────
+            st.session_state.matches = []
     except Exception as e:
         st.error(f"Connessione fallita: {e}")
+        # Stesso fix: anche in caso di eccezione di rete, impostiamo
+        # matches a lista vuota per non rientrare nel blocco di caricamento.
+        st.session_state.matches = []
 
 if "matches" in st.session_state:
     for m in st.session_state.matches:
@@ -358,22 +383,29 @@ if "matches" in st.session_state:
             with c2:
                 if st.button("Analisi AI", key=f"btn_{m['id']}", use_container_width=True):
                     with st.spinner("Elaborazione Dixon-Coles..."):
-                        res = run_pro_analysis(m, l_meta[league_name]["avg"])
-                        if res == "LIMIT_ERROR":
+                        analysis_result = run_pro_analysis(m, l_meta[league_name]["avg"])
+                        if analysis_result == "LIMIT_ERROR":
                             st.warning("⚠️ Limite API raggiunto. Attendi.")
                         else:
-                            st.session_state[f"res_{m['id']}"] = res
+                            st.session_state[f"res_{m['id']}"] = analysis_result
 
+            # ─────────────────────────────────────────────────────
+            # BUG FIX #3 — Variable shadowing
+            # La variabile "r" usata qui per il risultato dell'analisi
+            # sovrascriveva silenziosamente la "r" della risposta HTTP
+            # del blocco precedente. Rinominata in "match_result" per
+            # evitare ogni ambiguità e comportamento imprevedibile.
+            # ─────────────────────────────────────────────────────
             if f"res_{m['id']}" in st.session_state:
-                r = st.session_state[f"res_{m['id']}"]
+                match_result = st.session_state[f"res_{m['id']}"]
                 st.markdown(f"""
                 <div class="result-area">
                     <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; font-family:'JetBrains Mono'; text-align:center;">
-                        <div><small style="color:#00d1ff;">1 X 2</small><br><b>{r['1']:.0f}%|{r['X']:.0f}%|{r['2']:.0f}%</b></div>
-                        <div><small style="color:#00d1ff;">G/NG</small><br><b>GG {r['GG']:.0f}%</b></div>
-                        <div><small style="color:#00d1ff;">U/O 2.5</small><br><b>U{r['U2.5']:.0f}%|O{r['O2.5']:.0f}%</b></div>
-                        <div><small style="color:#00d1ff;">xG</small><br><b>{r['xG_H']} — {r['xG_A']}</b></div>
-                        <div><small style="color:#00d1ff;">SUGGERIMENTO AI</small><br><span class="pick-badge">{r['PICK']}</span></div>
+                        <div><small style="color:#00d1ff;">1 X 2</small><br><b>{match_result['1']:.0f}%|{match_result['X']:.0f}%|{match_result['2']:.0f}%</b></div>
+                        <div><small style="color:#00d1ff;">G/NG</small><br><b>GG {match_result['GG']:.0f}%</b></div>
+                        <div><small style="color:#00d1ff;">U/O 2.5</small><br><b>U{match_result['U2.5']:.0f}%|O{match_result['O2.5']:.0f}%</b></div>
+                        <div><small style="color:#00d1ff;">xG</small><br><b>{match_result['xG_H']} — {match_result['xG_A']}</b></div>
+                        <div><small style="color:#00d1ff;">SUGGERIMENTO AI</small><br><span class="pick-badge">{match_result['PICK']}</span></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
